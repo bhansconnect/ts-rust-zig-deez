@@ -247,7 +247,7 @@ parseCallArgs : Parser -> Result (Parser, List Node) Parser
 parseCallArgs = \p0 ->
     when p0.remainingTokens is
         [RParen, ..] ->
-            Ok (p0, [])
+            Ok (advanceTokens p0 1, [])
 
         [_, ..] ->
             (p1, arg) <- parseExpression p0 precLowest |> Result.try

@@ -19,6 +19,7 @@ Value : [
     RetTrue,
     RetFalse,
     RetNull,
+    RetFn { params : List Str, body : Node, envIndex : Nat },
 
     # Errors are just strings.
     Err Str,
@@ -162,6 +163,7 @@ evalProgram = \e0, statements ->
         (e2, val) = evalNode e1 node
         when val is
             RetInt int -> Break (e2, Int int)
+            RetFn fn -> Break (e2, Fn fn)
             RetTrue -> Break (e2, True)
             RetFalse -> Break (e2, False)
             RetNull -> Break (e2, Null)
@@ -174,6 +176,7 @@ evalBlock = \e0, statements ->
         (e2, val) = evalNode e1 node
         when val is
             RetInt int -> Break (e2, RetInt int)
+            RetFn fn -> Break (e2, RetFn fn)
             RetTrue -> Break (e2, RetTrue)
             RetFalse -> Break (e2, RetFalse)
             RetNull -> Break (e2, RetNull)
@@ -322,6 +325,7 @@ evalNode = \e0, node ->
             (e1, exprVal) = evalNode e0 expr
             when exprVal is
                 Int int -> (e1, RetInt int)
+                Fn fn -> (e1, RetFn fn)
                 True -> (e1, RetTrue)
                 False -> (e1, RetFalse)
                 Null -> (e1, RetNull)
