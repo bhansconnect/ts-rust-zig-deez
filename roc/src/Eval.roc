@@ -62,15 +62,21 @@ newEnv : {} -> Env
 newEnv = \{} -> { rc: 1, inner: Dict.empty {}, outer: Err IsRoot }
 
 Evaluator : {
+    # Envs are mostly cleaned up via reference counting.
+    # One issue is that we don't clean up cycles at all.
+    # It is easy to make a cycle by storing a function in a variable.
+    # That function will reference the current env and stop it from ever being cleaned up.
+    # Maybe a more direct GC would work better than reference counting.
+    # Just need to traverse all data reachable from the root env.
     envs : List Env,
     currentEnv : Nat,
 }
 
-setVar : Evaluator, Str, Value -> (Evaluator, Value)
+setVar : Evaluator, Str, Value -> Evaluator
 setVar = \{ envs: envs0, currentEnv }, ident, val ->
     { list: envs1, value: { rc, inner, outer } } = List.replace envs0 currentEnv (newEnv {})
     nextInner = Dict.insert inner ident val
-    ({ currentEnv, envs: List.set envs1 currentEnv { rc, inner: nextInner, outer } }, val)
+    { currentEnv, envs: List.set envs1 currentEnv { rc, inner: nextInner, outer } }
 
 getVar : List Env, Nat, Str -> Value
 getVar = \envs, currentEnv, ident ->
@@ -88,49 +94,43 @@ getVar = \envs, currentEnv, ident ->
 incEnv : Evaluator, Nat -> Evaluator
 incEnv = \{ envs, currentEnv }, i ->
     { rc, inner, outer } = List.get envs i |> okOrUnreachable "bad env index"
-    when outer is
-        Ok nextI ->
-            nextRc = Num.addSaturated rc 1
-            nextEnvs = List.set envs (Num.toNat i) { rc: nextRc, inner, outer: Ok nextI }
-            { envs: nextEnvs, currentEnv }
-            |> incEnv nextI
-
-        _ ->
-            nextRc = Num.addSaturated rc 1
-            nextEnvs = List.set envs (Num.toNat i) { rc: nextRc, inner, outer: Err IsRoot }
-            { envs: nextEnvs, currentEnv }
+    nextRc = Num.addSaturated rc 1
+    nextEnvs = List.set envs i { rc: nextRc, inner, outer }
+    { envs: nextEnvs, currentEnv }
 
 decEnv : Evaluator, Nat -> Evaluator
 decEnv = \{ envs, currentEnv }, i ->
     { rc, inner, outer } = List.get envs i |> okOrUnreachable "bad env index"
-    when outer is
-        Ok nextI ->
-            nextRc = Num.subSaturated rc 1
-            nextEnvs = List.set envs (Num.toNat i) { rc: nextRc, inner, outer: Ok nextI }
-            { envs: nextEnvs, currentEnv }
-            |> decEnv nextI
-            |> maybeFreeEnv i
+    nextRc = Num.subSaturated rc 1
+    nextEnvs = List.set envs i { rc: nextRc, inner, outer }
+    { envs: nextEnvs, currentEnv }
+    |> maybeFreeEnv i
+
+maybeFreeEnv = \{ envs: envs0, currentEnv }, i ->
+    { rc, inner, outer } = List.get envs0 i |> okOrUnreachable "bad env index"
+    if rc == 0 then
+        nullEnv = { rc: 0, inner: Dict.empty {}, outer: Err IsRoot }
+        envs1 = List.set envs0 i nullEnv
+        e1 =
+            e0, _, val <- Dict.walk inner { envs: envs1, currentEnv }
+            freeVal e0 val
+        when outer is
+            Ok outerIndex ->
+                e1
+                |> decEnv outerIndex
+
+            _ ->
+                e1
+    else
+        { envs: envs0, currentEnv }
+
+freeVal = \e0, val ->
+    when val is
+        Fn { envIndex } ->
+            decEnv e0 envIndex
 
         _ ->
-            nextRc = Num.subSaturated rc 1
-            nextEnvs = List.set envs (Num.toNat i) { rc: nextRc, inner, outer: Err IsRoot }
-            { envs: nextEnvs, currentEnv }
-            |> maybeFreeEnv i
-
-maybeFreeEnv = \{ envs, currentEnv }, i ->
-    when List.get envs (Num.toNat i) is
-        Ok { rc: 0, inner } ->
-            e0, _, val <- Dict.walk inner { envs, currentEnv }
-            when val is
-                Fn { envIndex } ->
-                    e0
-                    |> decEnv envIndex
-
-                _ ->
-                    e0
-
-        _ ->
-            { envs, currentEnv }
+            e0
 
 wrapAndSetEnv : Evaluator, Nat -> Evaluator
 wrapAndSetEnv = \{ envs }, i ->
@@ -159,8 +159,12 @@ evalWithEnvs = \program, envs ->
 
 evalProgram : Evaluator, List Node -> (Evaluator, Value)
 evalProgram = \e0, statements ->
-    List.walkUntil statements (e0, Null) \(e1, _), node ->
-        (e2, val) = evalNode e1 node
+    List.walkUntil statements (e0, Null) \(e1, lastVal), node ->
+        # lastVal will never get used again, free it.
+        (e2, val) =
+            e1
+            |> freeVal lastVal
+            |> evalNode node
         when val is
             RetInt int -> Break (e2, Int int)
             RetFn fn -> Break (e2, Fn fn)
@@ -172,8 +176,12 @@ evalProgram = \e0, statements ->
 
 evalBlock : Evaluator, List Node -> (Evaluator, Value)
 evalBlock = \e0, statements ->
-    List.walkUntil statements (e0, Null) \(e1, _), node ->
-        (e2, val) = evalNode e1 node
+    List.walkUntil statements (e0, Null) \(e1, lastVal), node ->
+        # lastVal will never get used again, free it.
+        (e2, val) =
+            e1
+            |> freeVal lastVal
+            |> evalNode node
         when val is
             RetInt int -> Break (e2, RetInt int)
             RetFn fn -> Break (e2, RetFn fn)
@@ -336,7 +344,9 @@ evalNode = \e0, node ->
             (e1, exprVal) = evalNode e0 expr
             when exprVal is
                 Err e -> (e1, Err e)
-                _ -> setVar e1 ident exprVal
+                _ ->
+                    e2 = setVar e1 ident exprVal
+                    (e2, Null)
 
         Ident ident ->
             (e0, getVar e0.envs e0.currentEnv ident)
@@ -359,7 +369,7 @@ evalNode = \e0, node ->
 
                         (e6, _) =
                             List.walk params (e3, 0) \(e4, i), param ->
-                                (e5, _) =
+                                e5 =
                                     List.get argVals i
                                     |> okOrUnreachable "size checked"
                                     |> \argVal -> setVar e4 param argVal
